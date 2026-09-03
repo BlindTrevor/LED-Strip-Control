@@ -55,7 +55,8 @@ static void serialStatus(uint32_t now)
 static void manualDefaults()
 {
   // Something visible with no DMX and no screen: white sparkle over a dim blue
-  // background, which is the look that needs 11ch on the desk.
+  // background. Since the spectrum channel reaches white this is now available
+  // in 9ch too, but 11ch is still the way to set both colours independently.
   manual.master = 180;
   manual.fg     = { 255, 255, 255 };
   manual.bg     = {   0,   0,  40 };
@@ -112,9 +113,12 @@ static lv_obj_t *stFgSw   = NULL, *stBgSw   = NULL;
 
 static uint32_t savedAtMs = 0;
 
-// A slider bound to one byte of `manual`, with its own value label.
+// A slider bound to one byte of `manual`, with its own value label. The event
+// callback holds a pointer into this array, so it must not be resized or moved.
+// Ten rows today: master, speed, size, strobe, and RGB for fg and bg.
 struct Bind { uint8_t *target; lv_obj_t *lbl; };
-static Bind    binds[12];
+#define MAX_BINDS 12
+static Bind    binds[MAX_BINDS];
 static uint8_t bindN = 0;
 
 static char modeOpts[160];
@@ -185,7 +189,14 @@ static void sliderCb(lv_event_t *e)
 static void sliderRow(lv_obj_t *parent, const char *name, uint8_t *target,
                       lv_color_t accent)
 {
-  lv_obj_t *row = bare(parent, LV_PCT(100), 48);
+  // Silently dropping a control would be worse than a loud stop: the slider
+  // would draw but move nothing.
+  if (bindN >= MAX_BINDS) {
+    Serial.printf("[ui] MAX_BINDS exceeded adding '%s' - raise it\n", name);
+    return;
+  }
+
+  lv_obj_t *row = bare(parent, LV_PCT(100), 42);
 
   lv_obj_t *nm = caption(row, name);
   lv_obj_align(nm, LV_ALIGN_TOP_LEFT, 0, 0);
@@ -358,8 +369,12 @@ static void buildManual(lv_obj_t *page)
   lv_obj_set_style_pad_all(page, 12, 0);
   lv_obj_clear_flag(page, LV_OBJ_FLAG_SCROLLABLE);
 
+  // Two 364-high columns leave room for the note below. The rows are sized to
+  // fit, but scrolling is left enabled on both panels so that raising a row
+  // height or adding a control can never push something out of reach.
   // ---- left: level and movement ----
-  lv_obj_t *l = panel(page, 368, 380);
+  lv_obj_t *l = panel(page, 368, 364);
+  lv_obj_add_flag(l, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_align(l, LV_ALIGN_TOP_LEFT, 0, 0);
   lv_obj_set_flex_flow(l, LV_FLEX_FLOW_COLUMN);
   lv_obj_set_style_pad_row(l, 4, 0);
@@ -378,7 +393,8 @@ static void buildManual(lv_obj_t *page)
   sliderRow(l, "Strobe", &manual.strobe, COL_WARN);
 
   // ---- right: colour ----
-  lv_obj_t *r = panel(page, 368, 380);
+  lv_obj_t *r = panel(page, 368, 364);
+  lv_obj_add_flag(r, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_align(r, LV_ALIGN_TOP_RIGHT, 0, 0);
   lv_obj_set_flex_flow(r, LV_FLEX_FLOW_COLUMN);
   lv_obj_set_style_pad_row(r, 2, 0);

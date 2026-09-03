@@ -33,6 +33,14 @@ static uint16_t    gPhase = 0;
 static uint8_t     gSeq   = 0;
 
 // ------------------------------------------------------------ settings ----
+void settingsClamp()
+{
+  if (cfg.mode >= CM_COUNT) cfg.mode = CM_11CH;
+  uint16_t maxAddr = 513 - CM_FOOTPRINT[cfg.mode];
+  if (cfg.address < 1)       cfg.address = 1;
+  if (cfg.address > maxAddr) cfg.address = maxAddr;
+}
+
 void settingsLoad()
 {
   prefs.begin("ledctl", true);
@@ -41,10 +49,7 @@ void settingsLoad()
   cfg.standalone = prefs.getBool("alone", false);
   prefs.end();
 
-  if (cfg.mode >= CM_COUNT) cfg.mode = CM_11CH;
-  uint16_t maxAddr = 513 - CM_FOOTPRINT[cfg.mode];
-  if (cfg.address < 1)       cfg.address = 1;
-  if (cfg.address > maxAddr) cfg.address = maxAddr;
+  settingsClamp();
 }
 
 void settingsSave()
@@ -63,15 +68,42 @@ static inline uint8_t dch(uint16_t offset)     // offset 0 == start address
   return (c <= 512) ? dmxData[c] : 0;
 }
 
-// 0 = red, 128 = green, 255 = blue. A two-leg ramp, not a hue wheel - there is
-// deliberately no white or magenta in this space, so white sparkle needs 11ch.
+// Seven evenly spaced stops with smooth interpolation between them:
+//
+//     0 Red   ·   43 Yellow  ·   85 Green  ·  128 Cyan
+//   170 Blue  ·  213 Magenta ·  255 White
+//
+// The final leg (magenta -> white) desaturates, which is what brings white
+// within reach of a single channel. Stops fall every 255/6 = 42.5, so the
+// nominal values above are +/-1.
+static constexpr Rgb SPECTRUM_STOPS[7] = {
+  { 255,   0,   0 },   //   0  red
+  { 255, 255,   0 },   //  43  yellow
+  {   0, 255,   0 },   //  85  green
+  {   0, 255, 255 },   // 128  cyan
+  {   0,   0, 255 },   // 170  blue
+  { 255,   0, 255 },   // 213  magenta
+  { 255, 255, 255 },   // 255  white
+};
+
+static inline uint8_t lerp8(uint8_t a, uint8_t b, uint8_t t)
+{
+  return (uint8_t)((int16_t)a + (((int16_t)b - (int16_t)a) * (int16_t)t) / 255);
+}
+
 static Rgb spectrum(uint8_t v)
 {
+  uint16_t scaled = (uint16_t)v * 6;            // 0..1530 across six legs
+  uint8_t  leg    = (uint8_t)(scaled / 255);
+  uint8_t  t      = (uint8_t)(scaled % 255);
+  if (leg >= 6) { leg = 5; t = 255; }           // clamp 255 to exact white
+
+  const Rgb &a = SPECTRUM_STOPS[leg];
+  const Rgb &b = SPECTRUM_STOPS[leg + 1];
   Rgb o;
-  if (v < 128) { uint8_t t = (uint8_t)((uint16_t)v * 255 / 127);
-                 o.r = 255 - t; o.g = t;   o.b = 0; }
-  else         { uint8_t t = (uint8_t)((uint16_t)(v - 128) * 255 / 127);
-                 o.r = 0;       o.g = 255 - t; o.b = t; }
+  o.r = lerp8(a.r, b.r, t);
+  o.g = lerp8(a.g, b.g, t);
+  o.b = lerp8(a.b, b.b, t);
   return o;
 }
 
@@ -231,8 +263,10 @@ void setup()
 {
   settingsLoad();
 
-  // The display driver may already have opened this bus for touch/CH422G. If
-  // uiBegin() calls Wire.begin() itself, drop this line rather than call twice.
+  // One bus, four things on it: the satellites, the GT911 and the CH422G. Open
+  // it here, once, BEFORE uiBegin() - panelInit() in display.cpp is documented
+  // to reuse this bus rather than call Wire.begin() a second time, which would
+  // reset it and drop the satellites.
   Wire.begin(I2C_SDA, I2C_SCL, I2C_HZ);
 
   dmx_config_t dmxCfg = DMX_CONFIG_DEFAULT;

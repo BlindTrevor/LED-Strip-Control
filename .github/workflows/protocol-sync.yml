@@ -1,0 +1,26 @@
+name: Protocol.h sync
+
+# Protocol.h is duplicated because Arduino IDE 2.x only compiles headers that
+# live in the sketch folder. If the two copies drift the structs stop agreeing,
+# the satellites decode garbage, and nothing reports an error - the I2C writes
+# still succeed. So: fail the build instead.
+
+on:
+  push:
+    paths:
+      - '**/Protocol.h'
+      - '.github/workflows/protocol-sync.yml'
+      - 'tools/check-protocol-sync.ps1'
+  pull_request:
+    paths:
+      - '**/Protocol.h'
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compare the two copies of Protocol.h
+        shell: pwsh
+        run: ./tools/check-protocol-sync.ps1

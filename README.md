@@ -97,14 +97,52 @@ Divides 0–255 evenly across six effects:
 
 ### Colour spectrum channel (9ch only)
 
-`0` = red, `128` = green, `255` = blue — a two-leg ramp, **not** a hue wheel.
-There is deliberately no white or magenta in this space, so white-sparkle-over-
-blue needs **11ch**.
+Channels `2` (foreground) and `4` (background) select a colour from a single
+value, smoothly interpolated between seven evenly spaced stops:
+
+| DMX | Colour |
+|---:|---|
+| 0 | Red |
+| 43 | Yellow |
+| 85 | Green |
+| 128 | Cyan |
+| 170 | Blue |
+| 213 | Magenta |
+| 255 | **White** |
+
+Stops fall every 255 ÷ 6 = 42.5, so the values above are ±1. Anything between
+two stops is a smooth blend, which means fades through the spectrum work
+properly rather than jumping.
+
+The final leg desaturates from magenta to white, which is what brings white
+within reach of one channel. So **white sparkle over a blue background works in
+9ch**: `2` = 255 (white), `3` = 255, `4` = 170 (blue), `5` = 40, `6` = 230.
+
+What a single channel can't give you is white *and* a chosen hue independently —
+for that, `11ch` sets both colours as explicit RGB.
 
 ## Build
 
 Arduino IDE 2.x with the **esp32 by Espressif Systems** core.
-Libraries: **FastLED** (satellite) and **esp_dmx** ≥ 4.1 (controller).
+Libraries: **FastLED** (satellite), **esp_dmx** ≥ 4.1 and **LVGL 8.3.x**
+(controller).
+
+LVGL is optional. The controller detects it with `__has_include(<lvgl.h>)`; if
+it is not installed the firmware still builds and runs, just headless. So you
+can bring up DMX and the strips without touching the display at all.
+
+With LVGL installed, copy `lv_conf_template.h` out of the library folder to
+`lv_conf.h` **beside** it (not inside), set `#define LV_CONF_INCLUDE_SIMPLE 1`
+at the top, and:
+
+| Setting | Value | Why |
+|---|---|---|
+| `LV_COLOR_DEPTH` | `16` | RGB565, what the panel wants |
+| `LV_FONT_MONTSERRAT_22` | `1` | tab labels |
+| `LV_FONT_MONTSERRAT_28` | `1` | the big address / source readouts |
+| `LV_MEM_CUSTOM` | `1` | let it use the 8 MB PSRAM |
+
+The two fonts are optional — without them the UI still lays out, just smaller.
 
 Flash the satellite first, so there is something listening.
 
@@ -142,6 +180,100 @@ unplugged.
 2. In the controller's `config.h`, uncomment the matching `SATS[]` row.
 3. Raise `TOTAL_PIXELS` in **both** copies of `Protocol.h` to the sum.
 
+## Touchscreen UI
+
+Three tabs on the 800×480 panel:
+
+| Tab | Does |
+|---|---|
+| **Setup** | DMX start address (−10/−1/+1/+10, with the occupied channel range shown), channel mode, and an *Ignore DMX* switch for standalone use. **Save** writes to NVS. |
+| **Manual** | What standalone mode plays: master, effect, speed, size, strobe, and foreground / background RGB with live swatches. Writes straight into `manual`. |
+| **Status** | Read-only: DMX live or not, frames received, `i2cErr`, the patch, and the look actually going out. |
+
+Changing the channel mode re-clamps the address — going from 3ch to Pixel Map
+would otherwise leave a perfectly good address 290 channels past the end of the
+universe.
+
+### Bringing the display up
+
+`ui.cpp` is complete and contains **no hardware knowledge**. Everything about
+the RGB panel, the GT911 and the CH422G sits behind three hooks in
+`display.cpp`:
+
+```
+panelInit()    bring up panel + backlight + touch
+panelFlush()   blit an RGB565 rectangle
+panelTouch()   return true and a coordinate while a finger is down
+```
+
+The LVGL side of it — PSRAM draw buffers, display and input driver
+registration, the 1 ms tick — is already written. To light the screen up:
+
+1. Get any one stack drawing and reporting touch: `ESP32_Display_Panel`,
+   `Arduino_GFX` + LVGL, or Waveshare's own demo.
+2. Paste that into the three hooks.
+3. Set `DISPLAY_BRINGUP_READY` to `1` in `display.cpp`.
+
+Until then `displayBegin()` returns false and `uiTask()` prints the serial
+status line instead, so the DMX and I2C paths never depend on the screen.
+
+> **`panelInit()` must not call `Wire.begin()`.** `setup()` has already opened
+> GPIO8/9 for the satellites; re-opening it resets the bus and drops them.
+
+## Validating the I²C link
+
+ESP32 Arduino **I²C slave** mode is the least proven part of this design, so
+prove it before trusting it. `i2cErr` counts `Wire.endTransmission()` failures
+on the controller — every one is a parameter frame the satellite never saw.
+
+Do this headless, before the display is in the picture, so there is only one
+variable:
+
+1. One mini powered, flashed, SDA/SCL/**GND** to the terminal block. Watch the
+   controller's serial line: `i2cErr` must stay at **0** while `frames` climbs.
+2. Leave it running for ten minutes. A slave that works for thirty seconds and
+   then wedges is the classic failure — a hung mini holds SDA low, so the
+   symptom is `i2cErr` climbing by ~100/second and never recovering.
+3. Switch to **Pixel Map** and repeat. This is the hard case: ~390 bytes per
+   frame in four blocks instead of 14 bytes, and the satellite is inside
+   `FastLED.show()` for part of each frame. If errors appear only here, the
+   send rate is outrunning the slave — drop `SEND_HZ_PIXELS`.
+4. Only then bring the display up, and check `i2cErr` again. The GT911 is
+   polled on the same bus from core 1 while the link task drives it at 100 Hz
+   from core 0; errors that appear *only* after the screen works are that
+   contention, not the slave.
+
+If step 1 or 2 fails, the slave implementation is the problem and no amount of
+tuning the controller will fix it.
+
+## Fixture profile
+
+`gdtf/` holds the GDTF profile — **Sonic Lighting / LED Strip**, one fixture
+type with a DMX mode per channel mode above.
+
+```
+pwsh tools/generate-gdtf.ps1     # rebuild it
+pwsh tools/validate-gdtf.ps1     # check it before it reaches the desk
+```
+
+The generator reads `TOTAL_PIXELS` out of `Protocol.h`, so the pixel-map mode
+cannot drift from the firmware — raise the pixel count and re-run.
+
+Two things are deliberate:
+
+- **Strobe homes to 0.** Every strobe channel's first function is a plain
+  *Open* spanning 0–7 with `Default="0/1"`, and `InitialFunction` is spelled
+  out rather than left for the importer to guess. A full-strobe default has
+  cost an afternoon on this rig before.
+- **No `GeometryReference`.** ZerOS does not build cells from one — a valid
+  100-cell reference imports as a single flat fixture with numbered parameters
+  (`Red 2`, `Red 3`, …). The pixel-map mode uses 100 ordinary child `Beam`
+  geometries, which flattens the same way without pretending otherwise. Real
+  multicell needs a native profile from Zero 88.
+
+> `.zfix` is a `Z88C` binary container whose payload resisted deflate, zlib,
+> gzip and brotli at every offset. Don't try to author or decode one.
+
 ## Design notes
 
 **The controller owns the animation clock.** It sends a global `phase` in every
@@ -164,12 +296,29 @@ core 1 can never stall the output.
 
 ## Known issues
 
-- **`ui.cpp` is a headless placeholder.** The LVGL touchscreen layer is not
-  written yet — the display stack is still to be chosen.
+- **The display has never been brought up.** `ui.cpp` is written and complete,
+  but the three hooks in `display.cpp` are empty and `DISPLAY_BRINGUP_READY` is
+  `0`, so the firmware runs headless. See *Bringing the display up* above.
 - **ESP32 Arduino I²C *slave* mode is the weak link.** Validate it early: the
-  controller's status line reports `i2cErr`, which should stay at 0.
+  Status tab and the serial line both report `i2cErr`, which should stay at 0.
 - **The satellites share the I²C bus with the touch controller and CH422G.**
   A mini that hangs holds SDA low and takes the touchscreen with it. If the UI
-  dies, suspect a mini first.
+  dies, suspect a mini first. Once the panel is up, the GT911 is also being
+  polled on that bus from core 1 while the link task drives it at 100 Hz from
+  core 0 — if `i2cErr` only starts climbing after the screen works, that
+  contention is the first place to look.
 - **`Protocol.h` is duplicated** in both sketch folders and must stay
-  byte-identical.
+  byte-identical — Arduino IDE 2.x only compiles headers inside the sketch
+  folder. Drift is silent and nasty: the structs stop agreeing, the satellites
+  decode garbage, and the I²C writes still succeed so nothing reports an error.
+
+  ```
+  pwsh tools/check-protocol-sync.ps1                # compare
+  pwsh tools/check-protocol-sync.ps1 -Fix           # controller -> satellite
+  pwsh tools/check-protocol-sync.ps1 -InstallHook   # block commits that drift
+  ```
+
+  CI runs the same check on any push that touches either copy. Converting to
+  PlatformIO (two environments plus `lib/Protocol/`) would remove the
+  duplication properly, and is still worth doing once the display is working —
+  doing both at once means a failed build could be either.

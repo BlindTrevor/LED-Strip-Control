@@ -38,7 +38,8 @@
 
 #include <Arduino.h>
 #include "display.h"
-#include "config.h"
+// Deliberately NOT config.h - it defines the static SATS[] table, which would
+// go unused in this file and warn in every build.
 
 #define DISPLAY_BRINGUP_READY 0     // <-- set to 1 once the hooks below are real
 
@@ -158,9 +159,9 @@ bool displayBegin()
   lv_color_t *b2 = (lv_color_t *)heap_caps_malloc(n * sizeof(lv_color_t),
                                                   MALLOC_CAP_SPIRAM);
   if (!b1) {                                  // no PSRAM? take a smaller bite
+    if (b2) { heap_caps_free(b2); b2 = nullptr; }
     n  = DISP_H_RES * 10;
     b1 = (lv_color_t *)heap_caps_malloc(n * sizeof(lv_color_t), MALLOC_CAP_DMA);
-    b2 = nullptr;
   }
   if (!b1) {
     Serial.println("[display] draw buffer alloc failed - running headless.");
@@ -184,9 +185,10 @@ bool displayBegin()
   // LVGL needs a millisecond tick. loop() also runs settingsSave(), which
   // blocks on an NVS write, so drive the tick from a timer rather than from
   // elapsed-time bookkeeping in uiTask().
-  const esp_timer_create_args_t ta = { .callback = tickCb, .arg = nullptr,
-                                       .dispatch_method = ESP_TIMER_TASK,
-                                       .name = "lv_tick", .skip_unhandled_events = true };
+  esp_timer_create_args_t ta = {};
+  ta.callback = tickCb;
+  ta.arg      = nullptr;
+  ta.name     = "lv_tick";
   esp_timer_create(&ta, &tickTimer);
   esp_timer_start_periodic(tickTimer, 1000);
 #endif

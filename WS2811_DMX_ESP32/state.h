@@ -4,7 +4,14 @@
 #include "config.h"
 
 // The controller has no FastLED dependency - it never renders.
-struct Rgb { uint8_t r = 0, g = 0, b = 0; };
+struct Rgb {
+  uint8_t r, g, b;
+  // Explicit constructors, not default member initialisers: a struct with
+  // NSDMIs is not an aggregate under -std=gnu++11, which the ESP32 Arduino
+  // 2.x core still uses, so brace-init would fail to compile there.
+  constexpr Rgb() : r(0), g(0), b(0) {}
+  constexpr Rgb(uint8_t R, uint8_t G, uint8_t B) : r(R), g(G), b(B) {}
+};
 
 struct Params {
   uint8_t master = 0;
@@ -34,6 +41,11 @@ extern uint32_t i2cErrors;
 
 void settingsLoad();
 void settingsSave();
+
+// Pull cfg.address back into 1..(513 - footprint) for the current mode. Call
+// after anything changes cfg.mode - switching 3ch -> Pixel Map can leave a
+// perfectly good address 200 channels past the end of the universe.
+void settingsClamp();
 
 // ---- UI layer (ui.cpp) ---------------------------------------------------
 void uiBegin();
