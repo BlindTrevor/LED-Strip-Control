@@ -404,6 +404,27 @@ core 1 can never stall the output.
   Status tab and the serial line both report `i2cErr`, which should stay at 0.
   That figure is only meaningful now the satellites are outside the CH422G's
   address block.
+- **A satellite losing power looks exactly like the controller dying.** An
+  unpowered ESP32 still has ESD diodes from every GPIO to a rail now sitting at
+  0 V, so the bus pull-ups push current through the mini's SDA/SCL pins and
+  clamp both lines at roughly 0.6 V. The whole bus reads low. The GT911 is on
+  those same two wires and is polled from core 1 every frame, so every poll
+  costs the full `Wire` timeout and the UI starves — the screen goes
+  unresponsive and the S3 looks dead, when what actually happened is that a
+  mini lost power.
+
+  Toggling SCL to recover the bus does not help: nothing is *driving* the line
+  low, a diode is clamping it. So the firmware backs off instead — `Wire`
+  timeout cut to 15 ms, and the GT911 poll drops to twice a second after four
+  consecutive failures. The screen keeps drawing, `i2cErr` keeps climbing on
+  the Status tab, and touch returns by itself when power does.
+
+  The real fix is electrical, and it is already in *Wiring*: run both boards
+  from the 12 V PSU so neither can be up while the other is down. This mostly
+  bites on the bench, with the mini USB-powered. To harden it against a
+  satellite genuinely failing on a rig, an I²C buffer such as a PCA9517 between
+  the S3's bus and the satellite terminal would isolate the segments so a dead
+  mini cannot pull the controller's bus down.
 - **The satellites share the I²C bus with the touch controller and CH422G.**
   A mini that hangs holds SDA low and takes the touchscreen with it. If the UI
   dies, suspect a mini first. Once the panel is up, the GT911 is also being

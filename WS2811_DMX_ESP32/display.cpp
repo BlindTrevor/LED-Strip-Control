@@ -300,24 +300,52 @@ static void panelFlush(int32_t x1, int32_t y1, int32_t x2, int32_t y2,
 //  GT911 actually reports something.
 static bool panelTouch(int16_t *x, int16_t *y)
 {
-  static bool    held  = false;
-  static int16_t lastX = 0, lastY = 0;
+  static bool     held    = false;
+  static int16_t  lastX   = 0, lastY = 0;
+  static uint8_t  fails   = 0;
+  static uint32_t nextTry = 0;
+
+  //  BACK OFF WHEN THE BUS IS DEAD.
+  //
+  //  A satellite that loses power does not simply stop answering: its GPIOs
+  //  still have ESD diodes to a rail that is now at 0 V, so the pull-ups drag
+  //  current through them and SDA/SCL sit clamped around 0.6 V. The whole bus
+  //  reads low, and every transaction costs the full Wire timeout (50 ms by
+  //  default). The GT911 is on that same bus and is polled from core 1 every
+  //  frame, so two timeouts per poll starve LVGL and the UI appears to hang -
+  //  the S3 looks dead because a mini lost power.
+  //
+  //  Toggling SCL to recover would not help; nothing is holding the line, a
+  //  diode is clamping it. So stop asking so often. The screen keeps drawing,
+  //  touch resumes by itself when power returns, and i2cErr on the Status tab
+  //  keeps climbing - which is the thing that actually tells you what happened.
+  *x = lastX;
+  *y = lastY;
+  if (fails >= 4 && (int32_t)(millis() - nextTry) < 0) return false;
 
   uint8_t status = 0;
   bool    ok     = gtRead(GT911_STATUS, &status, 1);
 
-  //  If it has stopped answering, it may have re-initialised onto its other
-  //  address. Re-probe occasionally rather than giving up for good.
   if (!ok) {
-    static uint32_t lastProbe = 0;
-    if (millis() - lastProbe > 500) {
-      lastProbe = millis();
-      if (gtProbe()) {
-        Serial.printf("[touch] GT911 reappeared at 0x%02X\n", gtAddr);
-        ok = gtRead(GT911_STATUS, &status, 1);
+    //  Once backed off, retry twice a second. That also covers the GT911
+    //  re-initialising onto its other address after a glitch, which is why the
+    //  probe tries both.
+    nextTry = millis() + 500;
+    if (fails < 4) {
+      fails++;
+      if (fails == 4) {
+        held = false;                 // do not leave a phantom finger down
+        Serial.println("[touch] GT911 not answering - backing off. "
+                       "A satellite that lost power clamps this bus.");
       }
     }
+    else if (gtProbe()) {
+      Serial.printf("[touch] GT911 back at 0x%02X\n", gtAddr);
+      fails = 0;
+    }
+    return false;
   }
+  if (fails) { fails = 0; Serial.println("[touch] GT911 answering again."); }
 
 #if DISPLAY_TOUCH_DEBUG
   // Heartbeat: proves this is being polled at all, and shows what the GT911

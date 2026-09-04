@@ -330,6 +330,13 @@ void setup()
   // reset it and drop the satellites.
   Wire.begin(I2C_SDA, I2C_SCL, I2C_HZ);
 
+  // The core defaults to 50 ms, which is an age when a dead bus makes EVERY
+  // transaction take the full timeout - and the GT911 is polled on this bus
+  // from core 1, so that is the UI's frame time. 15 ms is still enormous
+  // against a 14-byte write at 400 kHz (~0.4 ms) and leaves plenty of room for
+  // a satellite stretching the clock while it is inside FastLED.show().
+  Wire.setTimeOut(15);
+
   dmx_config_t dmxCfg = DMX_CONFIG_DEFAULT;
   dmx_driver_install(DMX_UART_NUM, &dmxCfg, NULL, 0);
   dmx_set_pin(DMX_UART_NUM, DMX_TX_PIN, DMX_RX_PIN, DMX_RTS_PIN);
