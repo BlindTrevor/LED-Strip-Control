@@ -230,19 +230,28 @@ Four tabs on the 800×480 panel:
 
 Preview renders from the exact `ParamsMsg` last put on the wire — captured in
 `sendParams()`, not re-derived — so it shows what the satellites were actually
-told, strobe included, and cannot drift from what is being sent. Pixel Map mode
-uses the real per-pixel DMX values. Two caveats: sparkle placement is
-per-satellite by design, so only its density is representative; and
-`preview.cpp` is a **second implementation** of the satellite's `render()`,
-which is the same drift hazard the README flags for `Protocol.h`. Change an
-effect and change both, or the preview quietly starts lying. The proper fix is
-a shared `Effects.h` in both sketch folders, covered by
-`tools/check-protocol-sync.ps1`.
+told, strobe included. Pixel Map mode uses the real per-pixel DMX values.
+
+**It cannot drift from the tape.** Both the satellite's renderer and this tab
+call `fxRender()` in `Effects.h`, which is shared byte-identically between the
+sketch folders and guarded by the same check as `Protocol.h`. The satellite
+passes its own segment (`SAT_OFFSET`, `SAT_PIXELS`); the preview passes the
+whole strip (offset 0, `TOTAL_PIXELS`). Every effect is computed in global
+pixel space either way, which is also what makes a chase run continuously
+across several strips instead of restarting on each.
+
+One thing it still cannot match exactly, by design: sparkle placement is local
+to each satellite so the strips twinkle independently. Its density and colour
+are right; the individual pixels are representative.
 
 The controller links FastLED for this, but only for its arithmetic — `sin8`,
 `fill_rainbow`, `blend`, `nscale8`, `qsub8`. No `addLeds()`, no `show()`, no
 RMT channel, no pin. Those curves are specific approximations, and a preview
 drawn with merely similar ones would be a confident lie.
+
+`master` is deliberately outside `fxRender()`: the satellite applies it through
+`FastLED.setBrightness()` at `show()` time, and the preview — which has no
+`show()` — scales the buffer instead. Same result, different mechanism.
 
 Changing the channel mode re-clamps the address — going from 3ch to Pixel Map
 would otherwise leave a perfectly good address 290 channels past the end of the
@@ -401,10 +410,12 @@ core 1 can never stall the output.
   polled on that bus from core 1 while the link task drives it at 100 Hz from
   core 0 — if `i2cErr` only starts climbing after the screen works, that
   contention is the first place to look.
-- **`Protocol.h` is duplicated** in both sketch folders and must stay
-  byte-identical — Arduino IDE 2.x only compiles headers inside the sketch
-  folder. Drift is silent and nasty: the structs stop agreeing, the satellites
-  decode garbage, and the I²C writes still succeed so nothing reports an error.
+- **`Protocol.h` and `Effects.h` are duplicated** in both sketch folders and
+  must stay byte-identical — Arduino IDE 2.x only compiles headers inside the
+  sketch folder. Drift in either is silent and nasty. `Protocol.h`: the structs
+  stop agreeing, the satellites decode garbage, and the I²C writes still succeed
+  so nothing reports an error. `Effects.h`: the Preview tab confidently shows a
+  different look from the one the tape renders.
 
   ```
   pwsh tools/check-protocol-sync.ps1                # compare
@@ -412,7 +423,8 @@ core 1 can never stall the output.
   pwsh tools/check-protocol-sync.ps1 -InstallHook   # block commits that drift
   ```
 
-  CI runs the same check on any push that touches either copy. Converting to
-  PlatformIO (two environments plus `lib/Protocol/`) would remove the
-  duplication properly, and is still worth doing once the display is working —
+  CI runs the same check on any push that touches any of the four copies.
+  Converting to PlatformIO (two environments plus a shared `lib/` folder) would
+  remove the duplication properly. The display is working now, so that argument
+  for deferring it has gone — but note the level-shifter work is still open, and
   doing both at once means a failed build could be either.

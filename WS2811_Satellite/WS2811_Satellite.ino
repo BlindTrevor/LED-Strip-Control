@@ -14,6 +14,7 @@
 #include <FastLED.h>
 #include <Wire.h>
 #include "Protocol.h"
+#include "Effects.h"
 
 // ================== PER-UNIT CONFIG - CHANGE FOR EACH MINI ==================
 #define SAT_UNIT     0      // 0, 1 or 2  -> I2C address 0x40, 0x41, 0x42
@@ -77,68 +78,12 @@ static void render()
   ParamsMsg p;
   memcpy(&p, (const void *)&rxParams, sizeof(p));
 
-  uint8_t decay = 8 + (p.speed >> 2);
-  for (uint16_t i = 0; i < SAT_PIXELS; i++)
-    sparkleBuf[i] = qsub8(sparkleBuf[i], decay);
-
-  if (pixelMode) {
-    for (uint16_t i = 0; i < SAT_PIXELS; i++)
-      leds[i] = CRGB(pixelBuf[i * 3], pixelBuf[i * 3 + 1], pixelBuf[i * 3 + 2]);
-  }
-  else {
-    CRGB    fg(p.fgR, p.fgG, p.fgB);
-    CRGB    bg(p.bgR, p.bgG, p.bgB);
-    uint8_t pos8 = p.phase >> 8;
-
-    switch (p.fx) {
-      case FX_BREATHE:
-        fill_solid(leds, SAT_PIXELS, fg);
-        nscale8(leds, SAT_PIXELS, sin8(pos8));
-        break;
-
-      case FX_RAINBOW: {
-        uint8_t d = 1 + (p.size >> 3);
-        fill_rainbow(leds, SAT_PIXELS, pos8 + (uint8_t)(SAT_OFFSET * d), d);
-        break;
-      }
-
-      case FX_CHASE: {
-        uint8_t gap = 2 + (p.size >> 5);          // 2..9 px spacing
-        fill_solid(leds, SAT_PIXELS, bg);
-        for (uint16_t g = 0; g < TOTAL_PIXELS; g += gap) {
-          uint16_t gi = (g + pos8) % TOTAL_PIXELS;
-          if (gi >= SAT_OFFSET && gi < SAT_OFFSET + SAT_PIXELS)
-            leds[gi - SAT_OFFSET] = fg;
-        }
-        break;
-      }
-
-      case FX_COMET: {
-        uint16_t head = ((uint32_t)p.phase * TOTAL_PIXELS) >> 16;
-        uint8_t  tail = 2 + (p.size >> 3);        // 2..33 px of trail
-        for (uint16_t i = 0; i < SAT_PIXELS; i++) {
-          int16_t d = (int16_t)head - (int16_t)(i + SAT_OFFSET);
-          if (d < 0) d += TOTAL_PIXELS;
-          uint8_t b = (d < tail) ? (uint8_t)(255 - ((uint16_t)d * 255) / tail) : 0;
-          leds[i] = blend(bg, fg, b);
-        }
-        break;
-      }
-
-      case FX_SPARKLE:
-        // Each satellite twinkles independently - that is what you want.
-        for (uint8_t i = 0; i <= (p.size >> 5); i++)
-          sparkleBuf[random16(SAT_PIXELS)] = 255;
-        for (uint16_t i = 0; i < SAT_PIXELS; i++)
-          leds[i] = blend(bg, fg, sparkleBuf[i]);
-        break;
-
-      case FX_SOLID:
-      default:
-        fill_solid(leds, SAT_PIXELS, fg);
-        break;
-    }
-  }
+  //  The effects themselves live in Effects.h, shared byte-identically with
+  //  the controller so its Preview tab cannot show a different look from the
+  //  one this renders. Global pixel space, written into this satellite's own
+  //  segment - that is what keeps a chase continuous across all the strips.
+  fxRender(leds, sparkleBuf, SAT_PIXELS, SAT_OFFSET, TOTAL_PIXELS, p,
+           pixelMode ? pixelBuf : nullptr);
 
   FastLED.setBrightness(scale8(MAX_BRIGHT, p.master));
   FastLED.show();
