@@ -20,7 +20,15 @@
 #define PROTO_MAGIC_PARAMS  0xA5
 #define PROTO_MAGIC_PIXELS  0xA6
 
-#define SAT_I2C_BASE        0x30    // unit 0 = 0x30, unit 1 = 0x31, ...
+// 0x40, NOT 0x30. The CH422G on the controller board does not occupy one
+// address, it ACKs the whole of 0x20-0x27 and 0x30-0x3F - verified by a bus
+// scan on the hardware. Satellites at 0x30..0x32 therefore sat inside it, and
+// every parameter frame was latched by the expander as well as by the mini,
+// clobbering the output register that drives backlight/DISP and both reset
+// lines. The screen would come up and go dark on the first frame. Worse, the
+// expander ACKs those addresses whether or not a mini is present, so i2cErr
+// read as healthy and proved nothing. 0x40..0x4F is clear on this board.
+#define SAT_I2C_BASE        0x40    // unit 0 = 0x40, unit 1 = 0x41, ...
 #define SAT_MAX             3
 #define TOTAL_PIXELS        100     // across every satellite, for pixel map
 #define PIXELS_PER_BLOCK    30      // keeps a block under the 128 B Wire buffer

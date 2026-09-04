@@ -531,6 +531,11 @@ void uiBegin()
   lv_obj_set_style_bg_color(tv, COL_BG, 0);
   lv_obj_set_style_text_font(lv_tabview_get_tab_btns(tv), FONT_MED, 0);
 
+  //  No swipe-to-change-tab. The tab buttons are large and always visible, so
+  //  the gesture buys nothing - and on an RGB panel being flushed 40 lines at
+  //  a time it drags a full-width redraw across the screen and flickers badly.
+  lv_obj_clear_flag(lv_tabview_get_content(tv), LV_OBJ_FLAG_SCROLLABLE);
+
   buildSetup (lv_tabview_add_tab(tv, "Setup"));
   buildManual(lv_tabview_add_tab(tv, "Manual"));
   buildStatus(lv_tabview_add_tab(tv, "Status"));

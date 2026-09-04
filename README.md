@@ -61,9 +61,31 @@ S3 terminal GND ──► mini GND          (essential)
 mini GPIO4 ──► strip DATA
 ```
 
-The minis drive the strips **directly from 3.3 V** — no level shifter, by
-design decision. A 12 V WS2811 wants ~3.5 V for a logic high, so this is
-marginal; a 74AHCT125 on 5 V is the fix if it proves unreliable.
+> **A level shifter is required. This is not optional.** The minis were
+> designed to drive the strips directly from 3.3 V; on the bench that does not
+> work. A 12 V WS2811 wants ~3.5 V for a logic high and 3.3 V sits just under
+> it, so the chips never latch a frame and hold their power-up state — the
+> strip lights **solid white and ignores everything**. Fit a **74AHCT125** (or
+> 74HCT245 / 74HCT04) on 5 V: the HCT input reads 3.3 V as a valid high and
+> re-transmits at 5 V.
+>
+> ```
+> mini GPIO4 ──[ 470R ]──► 74AHCT125 1A (pin 2)
+>                          74AHCT125 1Y (pin 3) ──► strip DATA
+>                          /1OE (pin 1) ──► GND
+>                          VCC  (pin 14) ──► 5 V
+>                          GND  (pin 7)  ──► common ground
+> ```
+>
+> Do not substitute a BSS138-style bidirectional module — too slow for 800 kHz.
+> A single transistor is also wrong: one stage inverts, and inverted WS2811
+> data is noise.
+>
+> The diagnosis is not a guess. The same strip, at the same `WS2811` / `BRG` /
+> 100-pixel settings, works correctly from an Arduino Mega — which drives 5 V.
+> Driven from a mini the GPIO measures a healthy 0.4 V average under continuous
+> refresh, three separate GPIOs behave identically, grounds are bonded and the
+> strip has its 12 V. Logic level is the only variable left.
 
 ## DMX personalities
 
@@ -190,7 +212,7 @@ unplugged.
 
 ## Adding a satellite
 
-1. In the satellite sketch set `SAT_UNIT` (→ I²C address `0x30 + unit`),
+1. In the satellite sketch set `SAT_UNIT` (→ I²C address `0x40 + unit`),
    `SAT_PIXELS` and `SAT_OFFSET` (its first index in the global strip).
 2. In the controller's `config.h`, uncomment the matching `SATS[]` row.
 3. Raise `TOTAL_PIXELS` in **both** copies of `Protocol.h` to the sum.
@@ -209,11 +231,13 @@ Changing the channel mode re-clamps the address — going from 3ch to Pixel Map
 would otherwise leave a perfectly good address 290 channels past the end of the
 universe.
 
-### Bringing the display up
+### The display
 
-`ui.cpp` is complete and contains **no hardware knowledge**. Everything about
-the RGB panel, the GT911 and the CH422G sits behind three hooks in
-`display.cpp`:
+Brought up and working: panel, backlight and GT911 touch. `ui.cpp` still
+contains **no hardware knowledge** — everything about the RGB panel, the GT911
+and the CH422G lives behind three hooks in `display.cpp`, driven straight from
+ESP-IDF's `esp_lcd_panel_rgb` with hand-written CH422G and GT911 code. No
+display library is needed.
 
 ```
 panelInit()    bring up panel + backlight + touch
@@ -221,19 +245,29 @@ panelFlush()   blit an RGB565 rectangle
 panelTouch()   return true and a coordinate while a finger is down
 ```
 
-The LVGL side of it — PSRAM draw buffers, display and input driver
-registration, the 1 ms tick — is already written. To light the screen up:
+`DISPLAY_BRINGUP_READY` is `1`. Set it to `0` to force the headless build back,
+in which `displayBegin()` returns false and `uiTask()` prints the serial status
+line instead. `DISPLAY_TOUCH_DEBUG 1` adds per-press and raw-register tracing.
 
-1. Get any one stack drawing and reporting touch: `ESP32_Display_Panel`,
-   `Arduino_GFX` + LVGL, or Waveshare's own demo.
-2. Paste that into the three hooks.
-3. Set `DISPLAY_BRINGUP_READY` to `1` in `display.cpp`.
-
-Until then `displayBegin()` returns false and `uiTask()` prints the serial
-status line instead, so the DMX and I2C paths never depend on the screen.
+Panel timings are 800×480, hfp 40 / hpw 48 / hbp 88, vfp 13 / vpw 3 / vbp 32,
+16 MHz pixel clock, `pclk_active_neg`, framebuffer in PSRAM.
 
 > **`panelInit()` must not call `Wire.begin()`.** `setup()` has already opened
 > GPIO8/9 for the satellites; re-opening it resets the bus and drops them.
+
+Four traps on this board, all of which cost bench time:
+
+- **EXIO3 is the panel reset.** Leave it low and the panel initialises
+  perfectly, reports no error, and stays completely dark.
+- **EXIO2 is backlight *and* the panel's DISP line.** It is on/off only. PWM
+  there drops DISP too and puts the panel into standby.
+- **The GT911's point registers start at `0x8150` with the X low byte.** The
+  track id is at `0x814F`, *before* that block — there is no id byte to skip.
+  Skipping one anyway shifts every read and turns X into garbage that fails a
+  range check, which looks exactly like a dead touch panel.
+- **The GT911 raises its status bit only when something changes**, and it
+  reports the lift as well as the press. "No new data" means "unchanged", not
+  "released". Report released on every quiet poll and no tap ever lands.
 
 ## Validating the I²C link
 
@@ -311,11 +345,20 @@ core 1 can never stall the output.
 
 ## Known issues
 
-- **The display has never been brought up.** `ui.cpp` is written and complete,
-  but the three hooks in `display.cpp` are empty and `DISPLAY_BRINGUP_READY` is
-  `0`, so the firmware runs headless. See *Bringing the display up* above.
+- **The strip needs a 5 V level shifter and does not work without one.** See
+  *Wiring* above. Until it is fitted the strip sits solid white.
+- **The CH422G answers to 24 I²C addresses**, not one: the whole of `0x20-0x27`
+  and `0x30-0x3F`. Verified by a bus scan on the hardware. This is why
+  `SAT_I2C_BASE` is `0x40` and must stay clear of that block. With satellites
+  at `0x30..0x32` every parameter frame was latched by the expander as well as
+  by the mini, clobbering the register that drives backlight, DISP and both
+  reset lines — the screen came up and went dark on the first frame. Worse,
+  the expander ACKs those addresses whether or not a mini is present, so
+  `i2cErr` read as healthy and proved nothing at all.
 - **ESP32 Arduino I²C *slave* mode is the weak link.** Validate it early: the
   Status tab and the serial line both report `i2cErr`, which should stay at 0.
+  That figure is only meaningful now the satellites are outside the CH422G's
+  address block.
 - **The satellites share the I²C bus with the touch controller and CH422G.**
   A mini that hangs holds SDA low and takes the touchscreen with it. If the UI
   dies, suspect a mini first. Once the panel is up, the GT911 is also being

@@ -16,7 +16,7 @@
 #include "Protocol.h"
 
 // ================== PER-UNIT CONFIG - CHANGE FOR EACH MINI ==================
-#define SAT_UNIT     0      // 0, 1 or 2  -> I2C address 0x30, 0x31, 0x32
+#define SAT_UNIT     0      // 0, 1 or 2  -> I2C address 0x40, 0x41, 0x42
 #define SAT_PIXELS   100    // pixels on THIS satellite's strip
 #define SAT_OFFSET   0      // this segment's first index in the global strip
                             //   unit 0: offset 0    unit 1: offset 100  etc.
