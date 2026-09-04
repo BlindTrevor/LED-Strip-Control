@@ -123,13 +123,28 @@ for that, `11ch` sets both colours as explicit RGB.
 
 ## Build
 
-Arduino IDE 2.x with the **esp32 by Espressif Systems** core.
-Libraries: **FastLED** (satellite), **esp_dmx** ≥ 4.1 and **LVGL 8.3.x**
-(controller).
+Arduino IDE 2.x with the **esp32 by Espressif Systems** core, pinned to
+**2.0.17**. Libraries: **FastLED** (satellite), **esp_dmx** ≥ 4.1 and
+**LVGL 8.3.x** (controller).
 
-LVGL is optional. The controller detects it with `__has_include(<lvgl.h>)`; if
-it is not installed the firmware still builds and runs, just headless. So you
-can bring up DMX and the strips without touching the display at all.
+> **Do not use core 3.x.** esp_dmx 4.1.0 is the newest release and supports
+> Arduino-ESP32 2.0.3+ / ESP-IDF 4.4.1+ only. On core 3.x, ESP-IDF 5 has
+> removed `module` from `uart_signal_conn_t` and `dmx/hal/uart.c` fails to
+> compile. 2.0.17 is the last of the 2.x line.
+
+LVGL is optional, via `UI_HAS_LVGL` in `display.h`. It defaults to `1`; set it
+to `0` to build on a machine without the library and the firmware still builds
+and runs, just headless. So you can bring up DMX and the strips without
+touching the display at all.
+
+This used to be automatic and silently was not. `__has_include(<lvgl.h>)`
+cannot work under the Arduino builder: libraries are discovered by scanning
+sources for `#include` directives, and their include paths are added only
+afterwards, so `<lvgl.h>` is unreachable at the moment `__has_include` is
+evaluated. It always answered "no", and the controller built headless with LVGL
+correctly installed — a green build in which not one line of `ui.cpp` had ever
+been compiled. If the controller comes out around 315 KB rather than ~453 KB,
+that is what has happened.
 
 With LVGL installed, copy `lv_conf_template.h` out of the library folder to
 `lv_conf.h` **beside** it (not inside), set `#define LV_CONF_INCLUDE_SIMPLE 1`

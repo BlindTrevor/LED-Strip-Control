@@ -16,17 +16,20 @@
  *  completely unaffected.
  * ========================================================================= */
 
-// --- is LVGL even installed? ----------------------------------------------
-//  Guarded so the sketch still compiles on a machine without the LVGL library.
-//  With LVGL absent, ui.cpp degrades to exactly the status line it printed
-//  before the UI existed, which keeps the DMX/I2C bench path buildable.
-#if defined(__has_include)
-#  if __has_include(<lvgl.h>)
-#    define UI_HAS_LVGL 1
-#  endif
-#endif
+// --- build the LVGL UI, or not? -------------------------------------------
+//  A deliberate switch, NOT auto-detection. `__has_include(<lvgl.h>)` cannot
+//  work here and was silently doing the wrong thing: the Arduino builder finds
+//  libraries by scanning sources for #include directives and only then adds
+//  their include paths, so <lvgl.h> is unreachable at the moment __has_include
+//  is evaluated. It therefore always answered "no", and the firmware built
+//  headless even with LVGL installed and lv_conf.h correct - a green build
+//  that had never compiled a line of ui.cpp.
+//
+//  Set this to 0 to build on a machine without the LVGL library. ui.cpp then
+//  degrades to exactly the status line it printed before the UI existed, which
+//  keeps the DMX/I2C bench path buildable.
 #ifndef UI_HAS_LVGL
-#  define UI_HAS_LVGL 0
+#  define UI_HAS_LVGL 1
 #endif
 
 #define DISP_H_RES 800
