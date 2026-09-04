@@ -26,6 +26,13 @@ bool     dmxAlive      = false;
 uint32_t dmxFrameCount = 0;
 uint32_t i2cErrors     = 0;
 
+//  The exact frame last put on the wire, kept so the Preview tab renders what
+//  the satellites were actually told rather than re-deriving it. Strobe is
+//  already folded into master here, which is why the preview blinks in step.
+ParamsMsg gSentParams  = {};
+bool      gSentPixels  = false;
+uint8_t   gSentPixelRgb[TOTAL_PIXELS * 3] = {0};
+
 static uint8_t     dmxData[DMX_PACKET_SIZE];   // [0] is the start code
 static uint32_t    lastDmxMs = 0;
 static Preferences prefs;
@@ -176,6 +183,8 @@ static void sendParams(const Params &p, uint16_t phase, uint8_t master)
   m.size  = p.size;
   m.speed = p.speed;
 
+  gSentParams = m;                 // for the Preview tab
+
   for (uint8_t s = 0; s < SAT_COUNT; s++) {
     Wire.beginTransmission(SATS[s].addr);
     Wire.write((const uint8_t *)&m, sizeof(m));
@@ -204,12 +213,72 @@ static void sendPixels()
         m.rgb[i * 3 + 0] = dch(o);
         m.rgb[i * 3 + 1] = dch(o + 1);
         m.rgb[i * 3 + 2] = dch(o + 2);
+        if (g < TOTAL_PIXELS) {                             // for the preview
+          gSentPixelRgb[g * 3 + 0] = m.rgb[i * 3 + 0];
+          gSentPixelRgb[g * 3 + 1] = m.rgb[i * 3 + 1];
+          gSentPixelRgb[g * 3 + 2] = m.rgb[i * 3 + 2];
+        }
       }
       Wire.beginTransmission(SATS[s].addr);
       Wire.write((const uint8_t *)&m, PIXELMSG_LEN(n));
       if (Wire.endTransmission() != 0) i2cErrors++;
       sent += n;
     }
+  }
+}
+
+// -------------------------------------------------------------- dmx task ----
+//  This must be its own task, and it must BLOCK.
+//
+//  esp_dmx's receive is built to wait on the packet boundary - that is how the
+//  driver stays locked to the break. Polling it from the link task with a zero
+//  timeout does not "drain a queue", it just asks "is a whole packet sitting
+//  here this instant?", which is almost never true while that task is busy
+//  sending to satellites. Measured against a Pulse DMC-6 transmitting a
+//  continuous ~44 Hz, the polled version caught 2 packets per second and then
+//  nothing at all, with zero decode errors - the packets were never collected
+//  rather than being collected badly.
+//
+//  So: dedicated task, blocking receive, pinned alongside the link task on
+//  core 0 so an LVGL redraw on core 1 can never delay DMX.
+static void dmxTask(void *)
+{
+#if DMX_RX_DEBUG
+  uint32_t dbgPkts = 0, dbgErr = 0, dbgNonDmx = 0, dbgLast = 0;
+  int      dbgLastErr  = 0;
+  uint16_t dbgLastSize = 0;
+  uint8_t  dbgLastSc   = 0;
+#endif
+
+  for (;;) {
+    dmx_packet_t pkt;
+    if (dmx_receive(DMX_UART_NUM, &pkt, DMX_TIMEOUT_TICK)) {
+#if DMX_RX_DEBUG
+      dbgPkts++;
+      dbgLastSize = pkt.size;
+      dbgLastSc   = pkt.sc;
+      if (pkt.err) { dbgErr++; dbgLastErr = pkt.err; }
+      else if (pkt.sc != DMX_SC) dbgNonDmx++;
+#endif
+      if (!pkt.err && pkt.sc == DMX_SC) {
+        dmx_read(DMX_UART_NUM, dmxData, pkt.size);
+        lastDmxMs = millis();
+        dmxFrameCount++;
+      }
+    }
+
+#if DMX_RX_DEBUG
+    uint32_t now = millis();
+    if (now - dbgLast >= 1000) {
+      dbgLast = now;
+      Serial.printf("[dmx] pkts/s=%lu err=%lu nonDmx=%lu lastSc=0x%02X "
+                    "lastSize=%u lastErr=%d frames=%lu alive=%d\n",
+                    (unsigned long)dbgPkts, (unsigned long)dbgErr,
+                    (unsigned long)dbgNonDmx, dbgLastSc, dbgLastSize,
+                    dbgLastErr, (unsigned long)dmxFrameCount, (int)dmxAlive);
+      dbgPkts = dbgErr = dbgNonDmx = 0;
+    }
+#endif
   }
 }
 
@@ -220,15 +289,6 @@ static void linkTask(void *)
   TickType_t next = xTaskGetTickCount();
 
   for (;;) {
-    dmx_packet_t pkt;
-    while (dmx_receive(DMX_UART_NUM, &pkt, 0)) {          // drain the queue
-      if (!pkt.err && pkt.sc == DMX_SC) {
-        dmx_read(DMX_UART_NUM, dmxData, pkt.size);
-        lastDmxMs = millis();
-        dmxFrameCount++;
-      }
-    }
-
     uint32_t now = millis();
     dmxAlive = (lastDmxMs != 0) && (now - lastDmxMs < DMX_TIMEOUT_MS);
 
@@ -251,6 +311,7 @@ static void linkTask(void *)
 
     gSeq++;
     bool pixels = fromDmx && cfg.mode == CM_301CH;
+    gSentPixels = pixels;
     sendParams(live, gPhase, master);
     if (pixels) sendPixels();
 
@@ -276,6 +337,9 @@ void setup()
   uiBegin();
 
   xTaskCreatePinnedToCore(linkTask, "link", 4096, NULL, 5, NULL, 0);
+  //  Higher priority than the link task: it spends nearly all its life blocked
+  //  on the packet boundary, so it costs almost nothing to let it pre-empt.
+  xTaskCreatePinnedToCore(dmxTask,  "dmx",  4096, NULL, 6, NULL, 0);
 }
 
 void loop()

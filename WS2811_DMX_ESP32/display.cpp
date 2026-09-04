@@ -379,9 +379,14 @@ static lv_disp_drv_t       dispDrv;
 static lv_indev_drv_t      indevDrv;
 static esp_timer_handle_t  tickTimer = nullptr;
 
-// 40 lines is a good compromise on this panel: big enough that LVGL is not
-// called back constantly, small enough that two of them fit in PSRAM without
-// crowding out the DMX buffers.
+// 16 lines x 800 x 2 bytes = 25 KB per buffer, 50 KB for the pair, which fits
+// internal SRAM alongside the DMX and I2C buffers. Fewer lines than the PSRAM
+// version below, but the bandwidth it frees is worth far more than the extra
+// flush callbacks cost.
+static const uint32_t BUF_LINES_INT = 8;
+
+// Only used if internal SRAM cannot supply the pair. Bigger, because in PSRAM
+// the callback overhead matters more than the memory does.
 static const uint32_t BUF_LINES = 40;
 
 static void flushCb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *px)
@@ -423,15 +428,30 @@ bool displayBegin()
 
   lv_init();
 
-  size_t n = DISP_H_RES * BUF_LINES;
-  lv_color_t *b1 = (lv_color_t *)heap_caps_malloc(n * sizeof(lv_color_t),
-                                                  MALLOC_CAP_SPIRAM);
-  lv_color_t *b2 = (lv_color_t *)heap_caps_malloc(n * sizeof(lv_color_t),
-                                                  MALLOC_CAP_SPIRAM);
-  if (!b1) {                                  // no PSRAM? take a smaller bite
+  //  Draw buffers go in INTERNAL SRAM, not PSRAM, and that is a deliberate
+  //  trade of size for bandwidth.
+  //
+  //  The RGB peripheral streams the whole framebuffer out of PSRAM continuously
+  //  - 800x480x2 at ~31 Hz is about 24 MB/s that must never be late. Put the
+  //  LVGL draw buffers in PSRAM too and rendering reads and writes PSRAM, then
+  //  the flush copies PSRAM to PSRAM, all competing with that stream. When the
+  //  LCD's FIFO loses the race it starts a line late and the entire image jumps
+  //  a few pixels sideways.
+  //
+  //  Internal SRAM is smaller, so fewer lines per buffer - but the render
+  //  traffic leaves PSRAM entirely and the flush becomes a one-way copy.
+  size_t n = DISP_H_RES * BUF_LINES_INT;
+  lv_color_t *b1 = (lv_color_t *)heap_caps_malloc(
+      n * sizeof(lv_color_t), MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+  lv_color_t *b2 = (lv_color_t *)heap_caps_malloc(
+      n * sizeof(lv_color_t), MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+
+  if (!b1) {                                  // internal SRAM too tight
     if (b2) { heap_caps_free(b2); b2 = nullptr; }
-    n  = DISP_H_RES * 10;
-    b1 = (lv_color_t *)heap_caps_malloc(n * sizeof(lv_color_t), MALLOC_CAP_DMA);
+    Serial.println("[display] internal draw buffers failed - falling back to PSRAM.");
+    n  = DISP_H_RES * BUF_LINES;
+    b1 = (lv_color_t *)heap_caps_malloc(n * sizeof(lv_color_t), MALLOC_CAP_SPIRAM);
+    b2 = (lv_color_t *)heap_caps_malloc(n * sizeof(lv_color_t), MALLOC_CAP_SPIRAM);
   }
   if (!b1) {
     Serial.println("[display] draw buffer alloc failed - running headless.");

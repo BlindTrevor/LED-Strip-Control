@@ -219,13 +219,30 @@ unplugged.
 
 ## Touchscreen UI
 
-Three tabs on the 800×480 panel:
+Four tabs on the 800×480 panel:
 
 | Tab | Does |
 |---|---|
 | **Setup** | DMX start address (−10/−1/+1/+10, with the occupied channel range shown), channel mode, and an *Ignore DMX* switch for standalone use. **Save** writes to NVS. |
 | **Manual** | What standalone mode plays: master, effect, speed, size, strobe, and foreground / background RGB with live swatches. Writes straight into `manual`. |
+| **Preview** | The look the tape would be showing, with no tape attached. |
 | **Status** | Read-only: DMX live or not, frames received, `i2cErr`, the patch, and the look actually going out. |
+
+Preview renders from the exact `ParamsMsg` last put on the wire — captured in
+`sendParams()`, not re-derived — so it shows what the satellites were actually
+told, strobe included, and cannot drift from what is being sent. Pixel Map mode
+uses the real per-pixel DMX values. Two caveats: sparkle placement is
+per-satellite by design, so only its density is representative; and
+`preview.cpp` is a **second implementation** of the satellite's `render()`,
+which is the same drift hazard the README flags for `Protocol.h`. Change an
+effect and change both, or the preview quietly starts lying. The proper fix is
+a shared `Effects.h` in both sketch folders, covered by
+`tools/check-protocol-sync.ps1`.
+
+The controller links FastLED for this, but only for its arithmetic — `sin8`,
+`fill_rainbow`, `blend`, `nscale8`, `qsub8`. No `addLeds()`, no `show()`, no
+RMT channel, no pin. Those curves are specific approximations, and a preview
+drawn with merely similar ones would be a confident lie.
 
 Changing the channel mode re-clamps the address — going from 3ch to Pixel Map
 would otherwise leave a perfectly good address 290 channels past the end of the
@@ -347,6 +364,25 @@ core 1 can never stall the output.
 
 - **The strip needs a 5 V level shifter and does not work without one.** See
   *Wiring* above. Until it is fitted the strip sits solid white.
+- **The RGB panel has no bandwidth to spare, and the UI is tuned around that.**
+  The peripheral streams the whole framebuffer out of PSRAM continuously —
+  ~24 MB/s that can never be late. Anything else touching PSRAM competes, and
+  when the LCD's FIFO loses the race the image jumps sideways or vertically.
+  This core cannot fix that properly: bounce buffers, which stage lines in
+  internal SRAM, are an ESP-IDF 5 feature and so need core 3.x, which
+  `esp_dmx` rules out. So it is managed instead, and all four of these matter:
+
+  | Measure | Why |
+  |---|---|
+  | LVGL draw buffers in **internal SRAM**, not PSRAM | rendering leaves PSRAM entirely; the flush becomes a one-way copy |
+  | `BUF_LINES_INT` = **8** | each flush's cache writeback holds the PSRAM bus half as long. This was the one that actually fixed it |
+  | Preview canvas in **internal SRAM**, and only rendered while its tab is showing | a tabview scrolls inactive pages out of view rather than hiding them, so a `LV_OBJ_FLAG_HIDDEN` check silently never fires |
+  | Update only what changed | `lv_label_set_text()` invalidates whether or not the text differs |
+
+  Raising the draw-buffer size, adding another animating widget, or moving a
+  frequently-written buffer to PSRAM will bring the jumping straight back. If
+  it ever needs more headroom, dropping `pclk_hz` from 16 MHz costs refresh
+  rate (~31 Hz at 16 MHz) but reduces the DMA's demand directly.
 - **The CH422G answers to 24 I²C addresses**, not one: the whole of `0x20-0x27`
   and `0x30-0x3F`. Verified by a bus scan on the hardware. This is why
   `SAT_I2C_BASE` is `0x40` and must stay clear of that block. With satellites

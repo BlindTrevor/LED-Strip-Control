@@ -29,6 +29,8 @@
 #include <Arduino.h>
 #include "state.h"
 #include "display.h"
+#include "preview.h"
+#include <esp_heap_caps.h>
 
 // ===========================================================================
 //  Fallback status line - also used whenever the panel is not up.
@@ -430,6 +432,111 @@ static lv_obj_t *statRow(lv_obj_t *parent, const char *name, lv_coord_t y)
   return v;
 }
 
+// ---------------------------------------------------------------------------
+//  Preview tab - what the tape would be doing
+//
+//  Drawn into one canvas rather than 100 little objects. A hundred styled
+//  objects would mean a hundred invalidated regions per frame, and every
+//  invalidated region is a chance to tear against a framebuffer the RGB
+//  peripheral is scanning out. One canvas is one region.
+//
+//  The canvas buffer is written directly rather than through lv_canvas_draw_*:
+//  compute the top row a pixel at a time, then memcpy it down the remaining
+//  rows. That is a few thousand PSRAM writes a frame instead of a hundred
+//  software-rendered rectangles.
+// ---------------------------------------------------------------------------
+#define PV_W      744
+#define PV_H       32
+#define PV_FPS     10
+
+#define PV_TAB_INDEX 2                  // Setup, Manual, Preview, Status
+
+static lv_obj_t   *pvCanvas   = nullptr;
+static lv_color_t *pvBuf      = nullptr;
+static lv_obj_t   *pvCaption  = nullptr;
+static lv_obj_t   *pvTabs     = nullptr;
+static uint32_t    pvRgb[TOTAL_PIXELS];
+
+static void setTextIfChanged(lv_obj_t *lbl, const char *s);   // defined below
+
+static void previewTick(lv_timer_t *)
+{
+  if (!pvCanvas || !pvBuf || !pvTabs) return;
+
+  //  Only render while this tab is actually on screen. A tabview does NOT hide
+  //  inactive pages - it scrolls them out of view - so a HIDDEN check silently
+  //  never fires and the canvas keeps writing 83 KB into PSRAM 15 times a
+  //  second on every other tab, competing with the LCD's own DMA reads.
+  if (lv_tabview_get_tab_act(pvTabs) != PV_TAB_INDEX) return;
+
+  previewRender(pvRgb);
+
+  // Top row: one canvas column per screen x, mapped back to a pixel index.
+  for (int x = 0; x < PV_W; x++) {
+    uint16_t idx = (uint16_t)(((uint32_t)x * TOTAL_PIXELS) / PV_W);
+    if (idx >= TOTAL_PIXELS) idx = TOTAL_PIXELS - 1;
+    uint32_t c = pvRgb[idx];
+    pvBuf[x] = lv_color_make((c >> 16) & 0xFF, (c >> 8) & 0xFF, c & 0xFF);
+  }
+  for (int y = 1; y < PV_H; y++)
+    memcpy(&pvBuf[y * PV_W], pvBuf, PV_W * sizeof(lv_color_t));
+
+  lv_obj_invalidate(pvCanvas);
+
+  char buf[64];
+  snprintf(buf, sizeof(buf), "%s   master %u   %u px",
+           FX_NAME[live.fx < FX_COUNT ? live.fx : 0], live.master,
+           (unsigned)TOTAL_PIXELS);
+  setTextIfChanged(pvCaption, buf);
+}
+
+static void buildPreview(lv_obj_t *page)
+{
+  lv_obj_set_style_pad_all(page, 12, 0);
+  lv_obj_clear_flag(page, LV_OBJ_FLAG_SCROLLABLE);
+
+  //  INTERNAL SRAM, for the same reason as the LVGL draw buffers: this canvas
+  //  is rewritten every frame, and doing that in PSRAM competes directly with
+  //  the LCD's continuous DMA reads. In PSRAM at 744x56 it was the only thing
+  //  still making the panel jump - Setup, Manual and Status were all clean.
+  //  744x32x2 = 47 KB, which fits alongside the 50 KB of draw buffers.
+  const size_t pvBytes = PV_W * PV_H * sizeof(lv_color_t);
+  pvBuf = (lv_color_t *)heap_caps_malloc(pvBytes,
+                                         MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+  if (!pvBuf) {
+    Serial.println("[ui] preview canvas fell back to PSRAM - expect tearing.");
+    pvBuf = (lv_color_t *)heap_caps_malloc(pvBytes, MALLOC_CAP_SPIRAM);
+  }
+  if (!pvBuf) {
+    lv_obj_t *l = lv_label_create(page);
+    lv_label_set_text(l, "Preview unavailable - no PSRAM for the canvas.");
+    lv_obj_set_style_text_color(l, COL_WARN, 0);
+    lv_obj_center(l);
+    return;
+  }
+  memset(pvBuf, 0, pvBytes);
+
+  pvCanvas = lv_canvas_create(page);
+  lv_canvas_set_buffer(pvCanvas, pvBuf, PV_W, PV_H, LV_IMG_CF_TRUE_COLOR);
+  lv_obj_align(pvCanvas, LV_ALIGN_TOP_MID, 0, 8);
+
+  pvCaption = lv_label_create(page);
+  lv_obj_set_style_text_font(pvCaption, FONT_MED, 0);
+  lv_obj_set_style_text_color(pvCaption, COL_TEXT, 0);
+  lv_obj_align(pvCaption, LV_ALIGN_TOP_MID, 0, PV_H + 24);
+  lv_label_set_text(pvCaption, "");
+
+  lv_obj_t *note = lv_label_create(page);
+  lv_label_set_text(note,
+      "Simulated from the frame last sent to the satellites.\n"
+      "Sparkle placement is per-satellite, so only its density matches.");
+  lv_obj_set_style_text_color(note, COL_MUTED, 0);
+  lv_obj_set_style_text_align(note, LV_TEXT_ALIGN_CENTER, 0);
+  lv_obj_align(note, LV_ALIGN_TOP_MID, 0, PV_H + 60);
+
+  lv_timer_create(previewTick, 1000 / PV_FPS, NULL);
+}
+
 static void buildStatus(lv_obj_t *page)
 {
   lv_obj_set_style_pad_all(page, 12, 0);
@@ -467,28 +574,60 @@ static void buildStatus(lv_obj_t *page)
 // Read-only mirror of what the link task is doing. `live` is written on core 0
 // without a lock, which is fine here: a torn read shows one stale byte for one
 // refresh, and this is a status display, not a control path.
+//  lv_label_set_text() invalidates the label whether or not the text actually
+//  differs, and an invalidated region is a region LVGL redraws into a
+//  framebuffer the RGB peripheral is scanning out at the same time. With no
+//  vsync to hide behind, every needless redraw is a chance to tear. So write
+//  only what has genuinely changed - most of this panel is static most of the
+//  time, and this drops the redraw rate by an order of magnitude.
+static void setTextIfChanged(lv_obj_t *lbl, const char *s)
+{
+  const char *cur = lv_label_get_text(lbl);
+  if (!cur || strcmp(cur, s) != 0) lv_label_set_text(lbl, s);
+}
+
+static void setColorIfChanged(lv_obj_t *o, lv_color_t c, lv_color_t *cache)
+{
+  if (cache->full == c.full) return;
+  *cache = c;
+  lv_obj_set_style_text_color(o, c, 0);
+}
+
+static void setBgIfChanged(lv_obj_t *o, lv_color_t c, lv_color_t *cache)
+{
+  if (cache->full == c.full) return;
+  *cache = c;
+  lv_obj_set_style_bg_color(o, c, 0);
+}
+
 static void refreshStatus(lv_timer_t *)
 {
+  static lv_color_t cDmx = { 0 }, cErr = { 0 }, cFg = { 0 }, cBg = { 0 };
+  char buf[48];
+
   bool fromDmx = dmxAlive && !cfg.standalone;
-  lv_label_set_text(stSource, fromDmx ? "DMX" : "MANUAL");
+  setTextIfChanged(stSource, fromDmx ? "DMX" : "MANUAL");
 
-  lv_label_set_text(stDmx, dmxAlive ? "live" : "no signal");
-  lv_obj_set_style_text_color(stDmx, dmxAlive ? COL_OK : COL_WARN, 0);
+  setTextIfChanged(stDmx, dmxAlive ? "live" : "no signal");
+  setColorIfChanged(stDmx, dmxAlive ? COL_OK : COL_WARN, &cDmx);
 
-  lv_label_set_text_fmt(stFrames, "%lu", (unsigned long)dmxFrameCount);
+  snprintf(buf, sizeof(buf), "%lu", (unsigned long)dmxFrameCount);
+  setTextIfChanged(stFrames, buf);
 
-  lv_label_set_text_fmt(stErr, "%lu", (unsigned long)i2cErrors);
-  lv_obj_set_style_text_color(stErr, i2cErrors ? COL_ERR : COL_OK, 0);
+  snprintf(buf, sizeof(buf), "%lu", (unsigned long)i2cErrors);
+  setTextIfChanged(stErr, buf);
+  setColorIfChanged(stErr, i2cErrors ? COL_ERR : COL_OK, &cErr);
 
-  lv_label_set_text_fmt(stAddr, "%u   %s", cfg.address,
-                        CM_NAME[cfg.mode < CM_COUNT ? cfg.mode : 0]);
-  lv_label_set_text_fmt(stLook, "%s   master %u",
-                        FX_NAME[live.fx < FX_COUNT ? live.fx : 0], live.master);
+  snprintf(buf, sizeof(buf), "%u   %s", cfg.address,
+           CM_NAME[cfg.mode < CM_COUNT ? cfg.mode : 0]);
+  setTextIfChanged(stAddr, buf);
 
-  lv_obj_set_style_bg_color(stFgSw,
-      lv_color_make(live.fg.r, live.fg.g, live.fg.b), 0);
-  lv_obj_set_style_bg_color(stBgSw,
-      lv_color_make(live.bg.r, live.bg.g, live.bg.b), 0);
+  snprintf(buf, sizeof(buf), "%s   master %u",
+           FX_NAME[live.fx < FX_COUNT ? live.fx : 0], live.master);
+  setTextIfChanged(stLook, buf);
+
+  setBgIfChanged(stFgSw, lv_color_make(live.fg.r, live.fg.g, live.fg.b), &cFg);
+  setBgIfChanged(stBgSw, lv_color_make(live.bg.r, live.bg.g, live.bg.b), &cBg);
 
   if (lblSaved && savedAtMs && millis() - savedAtMs > 2000) {
     lv_label_set_text(lblSaved, "");
@@ -528,6 +667,7 @@ void uiBegin()
   lv_obj_set_style_bg_color(scr, COL_BG, 0);
 
   lv_obj_t *tv = lv_tabview_create(scr, LV_DIR_TOP, 58);
+  pvTabs = tv;
   lv_obj_set_style_bg_color(tv, COL_BG, 0);
   lv_obj_set_style_text_font(lv_tabview_get_tab_btns(tv), FONT_MED, 0);
 
@@ -538,7 +678,8 @@ void uiBegin()
 
   buildSetup (lv_tabview_add_tab(tv, "Setup"));
   buildManual(lv_tabview_add_tab(tv, "Manual"));
-  buildStatus(lv_tabview_add_tab(tv, "Status"));
+  buildPreview(lv_tabview_add_tab(tv, "Preview"));
+  buildStatus (lv_tabview_add_tab(tv, "Status"));
 
   lv_timer_create(refreshStatus, 250, NULL);
   displaySetBacklight(100);

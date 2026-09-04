@@ -20,6 +20,7 @@
 #define DMX_TX_PIN     44
 #define DMX_RTS_PIN    -1       // board switches direction automatically
 #define DMX_TIMEOUT_MS 3000     // silence before falling back to manual
+#define DMX_RX_DEBUG   0        // 1 = per-second packet/error report on Serial
 
 // ------------------------------------------------- I2C link to satellites ----
 //  The board's own I2C bus, already broken out to the 3.5 mm terminal block.
